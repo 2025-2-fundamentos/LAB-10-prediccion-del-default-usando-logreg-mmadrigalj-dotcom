@@ -95,3 +95,129 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import pandas as pd
+import numpy as np
+import os
+import json
+import gzip
+import pickle
+
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.metrics import (
+    precision_score, balanced_accuracy_score, recall_score,
+    f1_score, confusion_matrix
+)
+
+# Paso 1: Cargar y limpiar los datos
+train_df = pd.read_csv("files/input/train_data.csv.zip", compression="zip")
+test_df = pd.read_csv("files/input/test_data.csv.zip", compression="zip")
+
+# Renombrar y limpiar columnas
+for df in [train_df, test_df]:
+    df.rename(columns={"default payment next month": "default"}, inplace=True)
+    df.drop(columns=["ID"], inplace=True)
+    df["EDUCATION"] = df["EDUCATION"].replace(0, np.nan)
+    df["MARRIAGE"] = df["MARRIAGE"].replace(0, np.nan)
+    df.dropna(inplace=True)
+    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
+
+# Paso 2: Separar X e Y
+x_train = train_df.drop(columns="default")
+y_train = train_df["default"]
+x_test = test_df.drop(columns="default")
+y_test = test_df["default"]
+
+# Paso 3: Crear el pipeline
+categorical = ["SEX", "EDUCATION", "MARRIAGE"]
+numerical = [col for col in x_train.columns if col not in categorical]
+
+preprocessor = ColumnTransformer(transformers=[
+    ("num", MinMaxScaler(), numerical),
+    ("cat", OneHotEncoder(handle_unknown="ignore"), categorical)
+])
+
+pipeline = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("select_k_best", SelectKBest(score_func=f_classif)),
+    ("model", LogisticRegression())  # sin class_weight
+])
+
+# Paso 4: Optimizar hiperparámetros
+param_grid = {
+    "model__C": [0.7, 0.8, 0.9],
+    "model__solver": ["liblinear", "saga"],
+    "model__max_iter": [1500],
+    "select_k_best__k": [1, 2, 5, 10]
+}
+
+cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+
+grid = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    scoring="balanced_accuracy",
+    cv=cv,
+    n_jobs=-1,
+    verbose=1
+)
+
+grid.fit(x_train, y_train)
+print("Mejores parámetros:", grid.best_params_)
+
+# Paso 5: Guardar modelo
+os.makedirs("files/models", exist_ok=True)
+with gzip.open("files/models/model.pkl.gz", "wb") as f:
+    pickle.dump(grid, f)
+
+# Paso 6: Calcular métricas
+y_train_pred = grid.predict(x_train)
+y_test_pred = grid.predict(x_test)
+
+metrics = [
+    {
+        "type": "metrics",
+        "dataset": "train",
+        "precision": float(round(precision_score(y_train, y_train_pred), 4)),
+        "balanced_accuracy": float(round(balanced_accuracy_score(y_train, y_train_pred), 4)),
+        "recall": float(round(recall_score(y_train, y_train_pred), 4)),
+        "f1_score": float(round(f1_score(y_train, y_train_pred), 4)),
+    },
+    {
+        "type": "metrics",
+        "dataset": "test",
+        "precision": float(round(precision_score(y_test, y_test_pred), 4)),
+        "balanced_accuracy": float(round(balanced_accuracy_score(y_test, y_test_pred), 4)),
+        "recall": float(round(recall_score(y_test, y_test_pred), 4)),
+        "f1_score": float(round(f1_score(y_test, y_test_pred), 4)),
+    },
+]
+
+# Paso 7: Matrices de confusión
+cm_train = confusion_matrix(y_train, y_train_pred)
+cm_test = confusion_matrix(y_test, y_test_pred)
+
+metrics.append({
+    "type": "cm_matrix",
+    "dataset": "train",
+    "true_0": {"predicted_0": int(cm_train[0, 0]), "predicted_1": int(cm_train[0, 1])},
+    "true_1": {"predicted_0": int(cm_train[1, 0]), "predicted_1": int(cm_train[1, 1])},
+})
+
+metrics.append({
+    "type": "cm_matrix",
+    "dataset": "test",
+    "true_0": {"predicted_0": int(cm_test[0, 0]), "predicted_1": int(cm_test[0, 1])},
+    "true_1": {"predicted_0": int(cm_test[1, 0]), "predicted_1": int(cm_test[1, 1])},
+})
+
+# Guardar métricas
+os.makedirs("files/output", exist_ok=True)
+with open("files/output/metrics.json", "w", encoding="utf-8") as f:
+    for entry in metrics:
+        f.write(json.dumps(entry) + "\n")
